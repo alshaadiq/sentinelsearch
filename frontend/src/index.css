@@ -16,9 +16,11 @@
 ::-webkit-scrollbar {
   width: 6px;
 }
+
 ::-webkit-scrollbar-track {
   background: #1f2937;
 }
+
 ::-webkit-scrollbar-thumb {
   background: #374151;
   border-radius: 3px;

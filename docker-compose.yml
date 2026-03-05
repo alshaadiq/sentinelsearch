@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   redis:
     image: redis:7-alpine
@@ -9,7 +7,7 @@ services:
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -28,6 +26,8 @@ services:
       redis:
         condition: service_healthy
     command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 2
+    environment:
+      - PYTHONPATH=/app
 
   worker:
     build:
@@ -43,6 +43,7 @@ services:
     command: celery -A workers.celery_app worker --loglevel=info --concurrency=2 -Q composite
     environment:
       - C_FORCE_ROOT=1
+      - PYTHONPATH=/app
 
   frontend:
     build:

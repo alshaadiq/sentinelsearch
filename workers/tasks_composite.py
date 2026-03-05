@@ -57,7 +57,7 @@ def run_composite(self: Task, *, job_id: str) -> dict:
     aoi_geojson = req["aoi"]
     date_start = req["date_start"]
     date_end = req["date_end"]
-    output_crs = req.get("output_crs", "EPSG:4326")
+    output_crs = req.get("output_crs", None)  # None → keep native UTM CRS
 
     # ── 2. STAC search ────────────────────────────────────────────────
     update_progress(job_id, "stac_search", 10, "Searching Planetary Computer STAC")
@@ -104,10 +104,26 @@ def run_composite(self: Task, *, job_id: str) -> dict:
 
     preview_path = export_preview(cog_path=cog_path, job_id=job_id)
 
-    # ── 7. Compute bbox from composite ───────────────────────────────
+    # ── 7. Compute bbox from exported COG (post-reproject, guaranteed correct) ──
+    import rasterio as _rio
     import rioxarray  # noqa: F401
-    bounds = composite_ds.rio.bounds()
-    bbox = [bounds[0], bounds[1], bounds[2], bounds[3]]
+    from pyproj import Transformer
+
+    native_crs = composite_ds.rio.crs
+    native_crs_str = str(native_crs) if native_crs else "EPSG:4326"
+
+    # Read bounds directly from the COG that will actually be displayed —
+    # this avoids any drift introduced by the UTM→WGS84 reprojection inside export_cog.
+    with _rio.open(cog_path) as _src:
+        _b = _src.bounds
+        _cog_crs = _src.crs
+    if _cog_crs and _cog_crs.to_epsg() != 4326:
+        _t = Transformer.from_crs(_cog_crs, "EPSG:4326", always_xy=True)
+        _w, _s = _t.transform(_b.left, _b.bottom)
+        _e, _n = _t.transform(_b.right, _b.top)
+        bbox_wgs84 = [_w, _s, _e, _n]
+    else:
+        bbox_wgs84 = [_b.left, _b.bottom, _b.right, _b.top]
 
     # Build band name list
     band_names: list[str] = list(composite_ds.data_vars.keys())
@@ -117,8 +133,8 @@ def run_composite(self: Task, *, job_id: str) -> dict:
         "preview_url": f"/data/previews/{preview_path.name}",
         "bands": band_names,
         "scene_count": used_scenes,
-        "crs": output_crs,
-        "bbox": list(bbox),
+        "crs": native_crs_str,
+        "bbox": bbox_wgs84,
     }
 
     mark_succeeded(job_id, result)

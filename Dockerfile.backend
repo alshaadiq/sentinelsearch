@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV GDAL_CONFIG=/usr/bin/gdal-config
 ENV CPLUS_INCLUDE_PATH=/usr/include/gdal
 ENV C_INCLUDE_PATH=/usr/include/gdal
+ENV PYTHONPATH=/app
 
 WORKDIR /app
 

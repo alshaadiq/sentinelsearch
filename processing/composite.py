@@ -30,6 +30,7 @@ import pystac
 import rioxarray  # noqa: F401 – activates .rio accessor
 import stackstac
 import xarray as xr
+from rasterio.enums import Resampling
 from shapely.geometry import shape
 
 logger = logging.getLogger(__name__)
@@ -69,15 +70,29 @@ def build_stack(
     geom = shape(aoi_geojson)
     minx, miny, maxx, maxy = geom.bounds
 
+    # Determine UTM EPSG from first item (Sentinel-2 STAC items carry proj:epsg)
+    epsg_val: int = 32632  # safe default (UTM zone 32 N, central Europe)
+    if items:
+        epsg_val = items[0].properties.get("proj:epsg") or epsg_val
+        # Fallback: infer from MGRS tile code, e.g. "32TPQ" → zone 32 → EPSG:32632
+        if not items[0].properties.get("proj:epsg"):
+            mgrs = items[0].properties.get("s2:mgrs_tile", "")
+            zone_digits = "".join(c for c in mgrs[:3] if c.isdigit())
+            if zone_digits:
+                epsg_val = 32600 + int(zone_digits)
+    logger.info("Using EPSG:%d for stackstac (from first item)", epsg_val)
+
     stack = stackstac.stack(
         items,
         assets=ANALYSIS_BANDS,
-        epsg=4326,
-        bounds=(minx, miny, maxx, maxy),
+        epsg=epsg_val,
+        bounds_latlon=(minx, miny, maxx, maxy),  # auto-reprojects WGS84 bbox to UTM
+        resolution=10,   # 10 m — native S-2 optical resolution (20 m bands upsampled)
         chunksize=CHUNK_XY,
         dtype="float32",
-        fill_value=np.nan,
-        resampling=stackstac.Resampling.nearest,
+        fill_value=np.float32("nan"),
+        resampling=Resampling.nearest,
+        rescale=False,  # keep raw DN values; Sentinel-2 L2A scale=1 anyway
     )
 
     logger.info(
@@ -136,64 +151,69 @@ def compute_greenest_pixel_composite(
     ndvi_raw = (b08 - b04) / (b08 + b04 + 1e-9)
     ndvi_masked = ndvi_raw.where(clear)  # NaN where cloud
 
-    # ── Trigger compute for argmax (compact operation) ────────────────
+    # ── NDVI argmax via dask – processes one spatial chunk at a time ────
+    # Each chunk: CHUNK_XY × CHUNK_XY × n_times × 4 B ≈ 32 MB  (never loads full array)
     logger.info("Computing NDVI argmax (greenest pixel selection) …")
-    ndvi_np: np.ndarray = ndvi_masked.values  # (time, y, x) – triggers Dask compute
 
-    # argmax ignoring NaN: any-valid fallback to 0 when all NaN
-    valid_count = np.sum(~np.isnan(ndvi_np), axis=0)  # (y, x)
-    # Replace fully-NaN pixels with 0 so argmax doesn't raise
-    ndvi_filled = np.where(np.isnan(ndvi_np), -999.0, ndvi_np)
-    t_star = np.nanargmax(ndvi_filled, axis=0).astype(np.int32)  # (y, x)
+    # Fill cloud-masked NaN with -999 so masked pixels never win argmax
+    ndvi_for_argmax = ndvi_masked.fillna(-999.0)
+    # any_valid: True where ≥1 cloud-free observation exists for this pixel
+    any_valid = clear.any(dim="time")  # (y, x) lazy
 
-    # Mask t_star where NO valid observation exists
-    no_valid = valid_count == 0
+    t_star = ndvi_for_argmax.argmax(dim="time").compute().values.astype(np.int32)  # (y, x)
+    no_valid = (~any_valid.compute().values)  # (y, x) bool
 
-    used_scenes = int(np.unique(t_star[~no_valid]).size)
-    logger.info(
-        "Greenest pixel selection: %d unique time steps used, %.1f%% pixels have no valid obs",
-        used_scenes,
-        np.mean(no_valid) * 100,
-    )
+    # Fallback: pixels with zero cloud-free obs → use unconstrained best pixel
+    # (preserves full AOI coverage; best-available rather than blank)
+    if no_valid.any():
+        pct = float(np.mean(no_valid) * 100)
+        logger.info("%.1f%% pixels lack cloud-free obs — applying unconstrained fallback", pct)
+        t_fallback = ndvi_raw.fillna(-999.0).argmax(dim="time").compute().values.astype(np.int32)
+        t_star[no_valid] = t_fallback[no_valid]
+        del t_fallback
 
-    # ── Select each band at t* per pixel ─────────────────────────────
-    logger.info("Selecting per-pixel best-time values for all bands …")
+    used_scenes = int(np.unique(t_star).size)
+    logger.info("Greenest pixel selection: %d unique time steps used", used_scenes)
 
-    # Compute full stack as numpy  (time × band × y × x)
-    # Done after clipping so spatial extent is small
-    stack_np: np.ndarray = stack.values  # triggers full Dask compute
-
+    # ── Select each band at t* per pixel — scene-by-scene ────────────
+    # For each unique scene index t: load ONE time slice (all 11 bands ≈ 250 MB),
+    # then copy the pixels where t_star == t into the output array.
+    # Peak memory: ~500 MB (output + one scene).  Never loads all 30 scenes at once.
+    logger.info("Selecting per-pixel best-time values — iterating %d scenes …", n_times)
     ny, nx = t_star.shape
-    n_bands = stack_np.shape[1]
+    n_bands_out = len(ANALYSIS_BANDS)
+    output_np = np.full((n_bands_out, ny, nx), np.nan, dtype=np.float32)
 
-    # Fancy index: for each (y, x) select stack_np[t_star[y,x], :, y, x]
-    yy, xx = np.mgrid[0:ny, 0:nx]
-    selected = stack_np[t_star, :, yy, xx]  # (y, x, band)
-    selected = np.transpose(selected, (2, 0, 1))  # (band, y, x)
+    for t_idx in range(n_times):
+        pixel_mask = t_star == t_idx
+        if not np.any(pixel_mask):
+            continue
+        # Load this single time step (all bands). shape: (band, y, x) ≈ 250 MB
+        scene_data = stack.isel(time=t_idx).compute().values  # → numpy (band, y, x)
+        for b_idx in range(n_bands_out):
+            output_np[b_idx][pixel_mask] = scene_data[b_idx][pixel_mask]
+        del scene_data
+        logger.debug("Applied scene t=%d, covering %d px", t_idx, int(pixel_mask.sum()))
 
-    # Apply nodata mask where no valid observation existed
-    selected[:, no_valid] = np.nan
-
-    # ── Build output xr.Dataset ───────────────────────────────────────
     y_coords = stack.y.values
     x_coords = stack.x.values
-
     output_vars: dict[str, xr.DataArray] = {}
-    for i, band_name in enumerate(ANALYSIS_BANDS):
-        da_out = xr.DataArray(
-            selected[i],
+    for b_idx, band_name in enumerate(ANALYSIS_BANDS):
+        output_vars[band_name] = xr.DataArray(
+            output_np[b_idx],
             dims=["y", "x"],
             coords={"y": y_coords, "x": x_coords},
             name=band_name,
             attrs={"long_name": band_name, "grid_mapping": "spatial_ref"},
         )
-        output_vars[band_name] = da_out
+    del output_np
 
     # ── Add NDVI as derived band ──────────────────────────────────────
     b04_final = output_vars["B04"].values.astype(np.float32)
     b08_final = output_vars["B08"].values.astype(np.float32)
     ndvi_final = (b08_final - b04_final) / (b08_final + b04_final + 1e-9)
-    ndvi_final[no_valid] = np.nan
+    # no_valid pixels now have fallback data; only blank if truly outside S2 coverage
+    # (in that case the scene_data values themselves will already be NaN)
 
     output_vars["NDVI"] = xr.DataArray(
         ndvi_final,
@@ -205,9 +225,11 @@ def compute_greenest_pixel_composite(
 
     composite_ds = xr.Dataset(output_vars)
 
-    # Attach CRS (Planetary Computer stacks in EPSG:4326 when epsg=4326)
-    composite_ds = composite_ds.rio.write_crs("EPSG:4326")
+    # Attach native UTM CRS (whatever stackstac chose for the items)
+    native_crs = stack.rio.crs
+    if native_crs is not None:
+        composite_ds = composite_ds.rio.write_crs(native_crs)
     composite_ds = composite_ds.rio.set_spatial_dims(x_dim="x", y_dim="y")
 
-    logger.info("Composite dataset built: %s", composite_ds)
+    logger.info("Composite dataset built: %s  CRS=%s", composite_ds, native_crs)
     return composite_ds, used_scenes

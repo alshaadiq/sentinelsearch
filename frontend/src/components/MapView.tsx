@@ -1,23 +1,30 @@
 /**
  * MapView – interactive Leaflet map with draw tools for AOI selection
- * and result overlay once a composite is ready.
+ * and result overlays for composites.
  */
 import React, { useEffect, useRef } from "react";
 import L from "leaflet";
 import "leaflet-draw";
 import type { GeoJSONGeometry } from "../api";
+import type { CompositeLayer } from "./LayersPanel";
+
+interface FitRequest {
+  bbox: [number, number, number, number];
+  seq: number; // incrementing so same bbox re-triggers
+}
 
 interface MapViewProps {
   onAoiDrawn: (geom: GeoJSONGeometry) => void;
-  previewUrl?: string;
-  previewBbox?: [number, number, number, number]; // [west, south, east, north]
+  layers: CompositeLayer[];
+  fitRequest?: FitRequest | null;
 }
 
-export const MapView: React.FC<MapViewProps> = ({ onAoiDrawn, previewUrl, previewBbox }) => {
+export const MapView: React.FC<MapViewProps> = ({ onAoiDrawn, layers, fitRequest }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const drawnItemsRef = useRef<L.FeatureGroup>(new L.FeatureGroup());
-  const overlayRef = useRef<L.ImageOverlay | null>(null);
+  // Track Leaflet overlays by layer id
+  const overlaysRef = useRef<Map<string, L.ImageOverlay>>(new Map());
 
   // ── Initialize map ──────────────────────────────────────────────────
   useEffect(() => {
@@ -80,9 +87,9 @@ export const MapView: React.FC<MapViewProps> = ({ onAoiDrawn, previewUrl, previe
     });
 
     map.on(L.Draw.Event.EDITED, () => {
-      const layers = drawnItemsRef.current.getLayers();
-      if (layers.length > 0) {
-        const geom = (layers[0] as L.Polygon).toGeoJSON().geometry as GeoJSONGeometry;
+      const ls = drawnItemsRef.current.getLayers();
+      if (ls.length > 0) {
+        const geom = (ls[0] as L.Polygon).toGeoJSON().geometry as GeoJSONGeometry;
         onAoiDrawn(geom);
       }
     });
@@ -100,25 +107,49 @@ export const MapView: React.FC<MapViewProps> = ({ onAoiDrawn, previewUrl, previe
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Show preview overlay when result arrives ───────────────────────
+  // ── Sync overlays whenever layers array changes ───────────────────
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
 
-    if (overlayRef.current) {
-      map.removeLayer(overlayRef.current);
-      overlayRef.current = null;
-    }
+    const current = overlaysRef.current;
+    const newIds = new Set(layers.map((l) => l.id));
 
-    if (previewUrl && previewBbox) {
-      const [west, south, east, north] = previewBbox;
+    // Remove overlays for layers that no longer exist
+    current.forEach((overlay, id) => {
+      if (!newIds.has(id)) {
+        map.removeLayer(overlay);
+        current.delete(id);
+      }
+    });
+
+    // Add / update overlays for current layers
+    layers.forEach((layer) => {
+      const [west, south, east, north] = layer.bbox;
       const bounds: L.LatLngBoundsExpression = [[south, west], [north, east]];
-      const overlay = L.imageOverlay(previewUrl, bounds, { opacity: 0.85 });
-      overlay.addTo(map);
-      overlayRef.current = overlay;
-      map.fitBounds(bounds, { padding: [20, 20] });
-    }
-  }, [previewUrl, previewBbox]);
+
+      const existing = current.get(layer.id);
+      if (!existing) {
+        // Create new overlay
+        const overlay = L.imageOverlay(layer.previewUrl, bounds, {
+          opacity: layer.visible ? layer.opacity : 0,
+          interactive: false,
+        });
+        overlay.addTo(map);
+        current.set(layer.id, overlay);
+      } else {
+        // Update opacity (handles visibility toggle + slider)
+        existing.setOpacity(layer.visible ? layer.opacity : 0);
+      }
+    });
+  }, [layers]);
+
+  // ── Fit bounds on demand ─────────────────────────────────────────
+  useEffect(() => {
+    if (!fitRequest || !mapRef.current) return;
+    const [west, south, east, north] = fitRequest.bbox;
+    mapRef.current.fitBounds([[south, west], [north, east]], { padding: [30, 30] });
+  }, [fitRequest?.seq]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div

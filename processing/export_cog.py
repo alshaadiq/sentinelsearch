@@ -45,7 +45,7 @@ OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
 def export_cog(
     composite_ds: xr.Dataset,
     job_id: str,
-    output_crs: str = "EPSG:4326",
+    output_crs: str | None = None,
 ) -> Path:
     """
     Write composite dataset to a Cloud Optimized GeoTIFF.
@@ -56,8 +56,9 @@ def export_cog(
         Output from :func:`processing.composite.compute_greenest_pixel_composite`.
     job_id : str
         Used to name the output file.
-    output_crs : str
-        Target CRS (e.g. "EPSG:4326" or "EPSG:32634").
+    output_crs : str or None
+        Target CRS e.g. "EPSG:4326" or "EPSG:32632".
+        None (default) keeps the native CRS of the composite.
 
     Returns
     -------
@@ -73,16 +74,32 @@ def export_cog(
     ds = composite_ds
     src_crs = ds.rio.crs
     if src_crs is None:
-        ds = ds.rio.write_crs("EPSG:4326")
-        src_crs = ds.rio.crs
+        src_crs_str = "EPSG:4326"
+        ds = ds.rio.write_crs(src_crs_str)
+    else:
+        src_crs_str = str(src_crs)
 
-    if str(src_crs).upper() != output_crs.upper():
-        logger.info("Reprojecting composite from %s to %s", src_crs, output_crs)
-        ds = ds.rio.reproject(output_crs)
+    effective_crs = output_crs or src_crs_str
+    if output_crs and output_crs.upper() != src_crs_str.upper():
+        logger.info("Reprojecting composite from %s to %s", src_crs_str, output_crs)
+        # write_nodata is only on DataArray.rio in rioxarray ≤0.15.x, not Dataset.rio
+        ds = xr.Dataset(
+            {var: ds[var].rio.write_nodata(np.nan, encoded=False) for var in ds.data_vars},
+            attrs=ds.attrs,
+        )
+        ds = ds.rio.reproject(output_crs, nodata=np.nan)
 
     # Collect bands in canonical order (only include those present)
     band_names = [b for b in OUTPUT_BAND_ORDER if b in ds.data_vars]
-    arrays = [ds[b].values.astype(np.float32) for b in band_names]
+
+    def _to_float32(da: xr.DataArray) -> np.ndarray:
+        """Extract a plain float32 numpy array, converting masked-array fill-values to NaN."""
+        arr = da.values
+        if isinstance(arr, np.ma.MaskedArray):
+            arr = arr.filled(np.nan)
+        return np.asarray(arr, dtype=np.float32)
+
+    arrays = [_to_float32(ds[b]) for b in band_names]
     data = np.stack(arrays, axis=0)  # (bands, height, width)
 
     height, width = data.shape[1], data.shape[2]
@@ -111,7 +128,7 @@ def export_cog(
         dtype="float32",
         width=width,
         height=height,
-        crs=rasterio.crs.CRS.from_string(output_crs),
+        crs=rasterio.crs.CRS.from_string(effective_crs),
         transform=transform,
         nodata=np.nan,
     ) as dst:
