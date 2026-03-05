@@ -51,7 +51,8 @@ logger = logging.getLogger(__name__)
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 BLEND_RADIUS_PX: int = 30          # feathering zone width (pixels) – 300 m @ 10 m
-SCL_CLOUD_CLASSES: frozenset[int] = frozenset({3, 8, 9, 10})
+SCL_CLOUD_CLASSES: frozenset[int] = frozenset({3, 7, 8, 9, 10})  # keep in sync with composite.py
+SCL_WATER_CLASS: int = 6           # SCL water — excluded from NN fill (basemap shows through)
 GAUSS_SIGMA_FACTOR: float = 0.33   # sigma = BLEND_RADIUS × GAUSS_SIGMA_FACTOR
 
 
@@ -100,12 +101,29 @@ def fill_composite_gaps(cog_path: Path) -> Path:
         # ── Read all bands into memory ────────────────────────────────
         data = src.read()  # shape: (n_bands, H, W)  float32
 
+    # Water pixels: cloud fill over water replaces river/lake with wrong land
+    # values (nearest-neighbour picks riverbank vegetation).  Instead we leave
+    # cloud-contaminated water pixels transparent so the basemap shows through.
+    if scl_idx is not None:
+        water_mask = (scl_arr == SCL_WATER_CLASS)  # (H, W) bool
+    else:
+        water_mask = np.zeros((height, width), dtype=bool)
+
     # Build combined bad mask:  cloud/shadow SCL class  OR  NaN in any optical band
+    # BUT exclude water pixels — they get NaN (transparent) rather than wrong NN fill.
     nan_bad = np.zeros((height, width), dtype=bool)
     for i, name in enumerate(band_names):
         if name != "SCL":
             nan_bad |= ~np.isfinite(data[i])
-    bad_mask = scl_bad | nan_bad  # (H, W) bool
+    bad_mask = (scl_bad | nan_bad) & ~water_mask  # (H, W) bool
+
+    # Force cloud-contaminated water pixels to NaN so they become transparent in preview
+    cloud_water = (scl_bad | nan_bad) & water_mask
+    if cloud_water.any():
+        for i, name in enumerate(band_names):
+            if name != "SCL":
+                data[i][cloud_water] = np.nan
+        logger.info("gap_fill: %d cloud-over-water px set transparent", int(cloud_water.sum()))
 
     n_bad = int(bad_mask.sum())
     n_total = height * width

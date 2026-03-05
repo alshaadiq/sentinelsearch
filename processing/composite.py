@@ -41,8 +41,21 @@ ANALYSIS_BANDS = [
     "B08", "B8A", "B11", "B12", "SCL",
 ]
 
-# SCL class codes that represent clouds / cloud-related contamination
-CLOUD_CLASSES = [3, 8, 9, 10]
+# SCL class codes that represent clouds / cloud-related contamination.
+# Class 7 (unclassified) is included because cloud edges often land here.
+CLOUD_CLASSES = [3, 7, 8, 9, 10]
+
+# Morphological buffer applied to the cloud mask (pixels).
+# Dilating the cloud region by this amount catches the hazy transition
+# zone around cloud edges that SCL under-classifies.
+CLOUD_BUFFER_PX = 12
+
+# Radiometric haze filter thresholds (Sentinel-2 L2A DN, scale 0–10000).
+# Applied AFTER SCL masking to catch thin cirrus / aerosol haze that SCL misses.
+# B02 (blue) is strongly elevated by scattering; clear land rarely exceeds 2000 DN.
+# B02/B04 (blue/red ratio) > HAZE_BR_RATIO indicates aerosol-dominated scenes.
+BLUE_HAZE_DN    = 2000   # B02 > this → hazy pixel
+HAZE_BR_RATIO   = 1.6    # B02/B04 > this AND B02 > 1200 → aerosol-haze pixel
 
 # Dask chunk size along spatial axes (pixels)
 CHUNK_XY = 512
@@ -141,11 +154,46 @@ def compute_greenest_pixel_composite(
         return stack.sel(band=name).drop_vars("band")
 
     scl = _band("SCL")
+    b02 = _band("B02")
     b04 = _band("B04")
     b08 = _band("B08")
 
     # ── Cloud mask: True = clear ──────────────────────────────────────
     clear = _cloud_mask(scl)  # (time, y, x) bool
+
+    # Dilate cloud region by CLOUD_BUFFER_PX to catch hazy cloud edges.
+    # binary_erosion of the clear mask ≡ binary_dilation of the cloud mask.
+    # Applied per time-slice via dask map_blocks (remains lazy).
+    if CLOUD_BUFFER_PX > 0:
+        _struct2d = np.ones(
+            (CLOUD_BUFFER_PX * 2 + 1, CLOUD_BUFFER_PX * 2 + 1), dtype=bool
+        )
+
+        def _erode_clear(block: np.ndarray) -> np.ndarray:
+            from scipy.ndimage import binary_erosion
+            out = np.empty_like(block)
+            for t in range(block.shape[0]):
+                out[t] = binary_erosion(
+                    block[t], structure=_struct2d, border_value=True
+                )
+            return out
+
+        _dilated_data = clear.data.map_blocks(
+            _erode_clear, dtype=bool,
+        )
+        clear = xr.DataArray(_dilated_data, coords=clear.coords, dims=clear.dims)
+        logger.info("Cloud mask dilated by %d px (SCL classes masked: %s)",
+                    CLOUD_BUFFER_PX, CLOUD_CLASSES)
+
+    # ── Radiometric haze filter (catches what SCL misses) ─────────────────
+    # Thin cirrus and aerosol haze lift the blue band well above clear-land levels.
+    # This filter operates on actual reflectance values, not SCL labels.
+    haze_blue = b02 > BLUE_HAZE_DN                         # absolute blue elevation
+    haze_ratio = (b02 / (b04 + 1e-6)) > HAZE_BR_RATIO     # blue/red excess → scattering
+    haze_mask = haze_blue | (haze_ratio & (b02 > 1200))    # (time, y, x) bool
+    clear = clear & ~haze_mask
+    logger.info("Radiometric haze filter applied (B02>%d or B02/B04>%.1f)",
+                BLUE_HAZE_DN, HAZE_BR_RATIO)
 
     # ── NDVI with cloud masking applied ──────────────────────────────
     ndvi_raw = (b08 - b04) / (b08 + b04 + 1e-9)
