@@ -71,8 +71,8 @@ export const LayersPanel: React.FC<LayersPanelProps> = ({
                                     onClick={() => onToggleVisible(layer.id)}
                                     title={layer.visible ? "Hide layer" : "Show layer"}
                                     className={`flex-shrink-0 w-6 h-6 rounded flex items-center justify-center transition-colors text-xs ${layer.visible
-                                            ? "text-sentinel-400 bg-sentinel-900/50 hover:bg-sentinel-900"
-                                            : "text-gray-600 bg-gray-700/60 hover:bg-gray-700"
+                                        ? "text-sentinel-400 bg-sentinel-900/50 hover:bg-sentinel-900"
+                                        : "text-gray-600 bg-gray-700/60 hover:bg-gray-700"
                                         }`}
                                 >
                                     {layer.visible ? (

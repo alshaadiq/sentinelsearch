@@ -82,7 +82,13 @@ def run_composite(self: Task, *, job_id: str) -> dict:
 
     stack = build_stack(items=items, aoi_geojson=aoi_geojson)
 
-    # ── 4. Cloud mask + NDVI composite ───────────────────────────────
+    # ── 4. BRDF normalisation ─────────────────────────────────────────
+    update_progress(job_id, "brdf", 30, "Applying BRDF c-factor normalisation")
+    from processing.brdf_correction import brdf_normalize_stack
+
+    stack = brdf_normalize_stack(stack=stack, items=items)
+
+    # ── 5. Cloud mask + NDVI composite ───────────────────────────────
     update_progress(job_id, "composite", 40, "Applying cloud mask and computing composite")
     from processing.composite import compute_greenest_pixel_composite
 

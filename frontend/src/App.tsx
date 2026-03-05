@@ -54,7 +54,7 @@ export default function App() {
   const [aoi, setAoi] = useState<GeoJSONGeometry | null>(null);
   const [dateStart, setDateStart] = useState<string>(() => {
     const d = new Date();
-    d.setMonth(d.getMonth() - 3);
+    d.setMonth(d.getMonth() - 2);
     return d.toISOString().split("T")[0];
   });
   const [dateEnd, setDateEnd] = useState<string>(() =>
