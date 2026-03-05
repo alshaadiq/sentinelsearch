@@ -53,7 +53,12 @@ logger = logging.getLogger(__name__)
 BLEND_RADIUS_PX: int = 30          # feathering zone width (pixels) – 300 m @ 10 m
 SCL_CLOUD_CLASSES: frozenset[int] = frozenset({3, 7, 8, 9, 10})  # keep in sync with composite.py
 SCL_WATER_CLASS: int = 6           # SCL water — excluded from NN fill (basemap shows through)
-GAUSS_SIGMA_FACTOR: float = 0.33   # sigma = BLEND_RADIUS × GAUSS_SIGMA_FACTOR
+GAUSS_SIGMA_FACTOR: float = 0.15   # sigma = BLEND_RADIUS × factor — kept small for sharpness
+# Maximum gap-fill reach: pixels further than this from any valid observation
+# are left as NaN (transparent → basemap shows through).  Without this limit,
+# huge cloud patches get filled from kilometers away with wrong land-cover colors,
+# creating large Voronoi polygon artifacts.
+MAX_FILL_DISTANCE_PX: int = 150    # 1 500 m at 10 m/px
 
 
 def fill_composite_gaps(cog_path: Path) -> Path:
@@ -144,6 +149,19 @@ def fill_composite_gaps(cog_path: Path) -> Path:
     valid_mask = ~bad_mask
     dist_to_valid, nn_indices = distance_transform_edt(bad_mask, return_indices=True)
 
+    # Pixels further than MAX_FILL_DISTANCE_PX from any valid pixel are left NaN.
+    # This prevents Voronoi-polygon artifacts over large cloud patches where
+    # NN fill would pull from kilometers away with wrong land-cover values.
+    too_far_mask = bad_mask & (dist_to_valid > MAX_FILL_DISTANCE_PX)
+    fill_mask = bad_mask & ~too_far_mask  # only fill the reachable bad pixels
+
+    n_too_far = int(too_far_mask.sum())
+    if n_too_far > 0:
+        logger.info(
+            "gap_fill: %d px (%.1f%%) too far from valid data (>%d px) — left transparent",
+            n_too_far, n_too_far / n_total * 100, MAX_FILL_DISTANCE_PX,
+        )
+
     # dist_inside:  for each bad pixel, its distance to the nearest VALID neighbour
     # Used to build blend weight: 0 near seam, 1 deep inside cloud patch
     # We re-use dist_to_valid (already computed above).
@@ -167,18 +185,21 @@ def fill_composite_gaps(cog_path: Path) -> Path:
         # Replace NaN with 0 before NN lookup so the array is arithmetically clean
         arr = np.nan_to_num(arr, nan=0.0)
 
-        # Step 1 – nearest-neighbour fill
-        arr[bad_mask] = arr[nn_indices[0][bad_mask], nn_indices[1][bad_mask]]
+        # Step 1 – nearest-neighbour fill (only within reach)
+        arr[fill_mask] = arr[nn_indices[0][fill_mask], nn_indices[1][fill_mask]]
 
         # Step 2 – Gaussian-smoothed version of the NN-filled array
         #          provides a spatially smooth "background" to blend toward
         arr_smooth = gaussian_filter(arr, sigma=sigma, mode="reflect")
 
-        # Step 3 – blend inside bad region:
+        # Step 3 – blend inside filled region:
         #   near seam  (blend_w ≈ 0) → use smooth bg (avoids sharp edge)
         #   deep inside (blend_w ≈ 1) → use NN fill (preserves patch texture)
         blended = arr_smooth * (1.0 - blend_w) + arr * blend_w
-        arr[bad_mask] = blended[bad_mask].astype(np.float32)
+        arr[fill_mask] = blended[fill_mask].astype(np.float32)
+
+        # Step 4 – pixels beyond MAX_FILL_DISTANCE_PX stay NaN (transparent)
+        arr[too_far_mask] = np.nan
 
         filled[i] = arr
 

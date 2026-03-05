@@ -35,11 +35,13 @@ from shapely.geometry import shape
 
 logger = logging.getLogger(__name__)
 
-# Analysis bands to fetch (SCL needed for cloud mask)
+# Analysis bands to fetch (SCL loaded separately with nearest-neighbor)
 ANALYSIS_BANDS = [
     "B02", "B03", "B04", "B05", "B06", "B07",
     "B08", "B8A", "B11", "B12", "SCL",
 ]
+# Reflectance-only bands — loaded with bilinear resampling for sub-pixel accuracy
+_REFLECTANCE_BANDS = [b for b in ANALYSIS_BANDS if b != "SCL"]
 
 # SCL class codes that represent clouds / cloud-related contamination.
 # Class 7 (unclassified) is included because cloud edges often land here.
@@ -52,10 +54,21 @@ CLOUD_BUFFER_PX = 12
 
 # Radiometric haze filter thresholds (Sentinel-2 L2A DN, scale 0–10000).
 # Applied AFTER SCL masking to catch thin cirrus / aerosol haze that SCL misses.
-# B02 (blue) is strongly elevated by scattering; clear land rarely exceeds 2000 DN.
-# B02/B04 (blue/red ratio) > HAZE_BR_RATIO indicates aerosol-dominated scenes.
+# B02 (blue) is strongly elevated by scattering; clear land typically < 2000 DN.
+# B02/B04 (blue/red ratio) > HAZE_BR_RATIO indicates aerosol-dominated pixels.
 BLUE_HAZE_DN    = 2000   # B02 > this → hazy pixel
 HAZE_BR_RATIO   = 1.6    # B02/B04 > this AND B02 > 1200 → aerosol-haze pixel
+
+# Scene-level haze rejection — ADAPTIVE.
+# Uses the best-quarter of scenes as a reference rather than a fixed DN
+# so it works equally well over dark forest, urban, and arid AOIs.
+# Reject scenes whose B02 median exceeds the 25th-percentile reference by
+# SCENE_HAZE_RELATIVE_FACTOR *or* SCENE_HAZE_MIN_MARGIN_DN, whichever is larger.
+# Safety: if the filter would leave fewer than SCENE_HAZE_MIN_KEEP scenes,
+# it is skipped entirely (avoids producing an empty / fully-gap-filled composite).
+SCENE_HAZE_RELATIVE_FACTOR = 1.6   # reject if median B02 > 1.6 × p25 reference
+SCENE_HAZE_MIN_MARGIN_DN   = 500   # floor: always ≥ 500 DN above reference
+SCENE_HAZE_MIN_KEEP        = 3     # never reject below this many scenes
 
 # Dask chunk size along spatial axes (pixels)
 CHUNK_XY = 512
@@ -95,18 +108,50 @@ def build_stack(
                 epsg_val = 32600 + int(zone_digits)
     logger.info("Using EPSG:%d for stackstac (from first item)", epsg_val)
 
-    stack = stackstac.stack(
+    # Reflectance bands: bilinear resampling preserves sub-pixel accuracy when
+    # warping scenes onto the common output grid (nearest-neighbor creates
+    # blocky stepping artefacts on continuous reflectance values).
+    stack_ref = stackstac.stack(
         items,
-        assets=ANALYSIS_BANDS,
+        assets=_REFLECTANCE_BANDS,
         epsg=epsg_val,
-        bounds_latlon=(minx, miny, maxx, maxy),  # auto-reprojects WGS84 bbox to UTM
-        resolution=10,   # 10 m — native S-2 optical resolution (20 m bands upsampled)
+        bounds_latlon=(minx, miny, maxx, maxy),
+        resolution=10,
+        chunksize=CHUNK_XY,
+        dtype="float32",
+        fill_value=np.float32("nan"),
+        resampling=Resampling.bilinear,
+        rescale=False,
+    )
+
+    # SCL is a classification layer: nearest-neighbor must be used so integer
+    # class codes are never blended into meaningless fractional values.
+    stack_scl = stackstac.stack(
+        items,
+        assets=["SCL"],
+        epsg=epsg_val,
+        bounds_latlon=(minx, miny, maxx, maxy),
+        resolution=10,
         chunksize=CHUNK_XY,
         dtype="float32",
         fill_value=np.float32("nan"),
         resampling=Resampling.nearest,
-        rescale=False,  # keep raw DN values; Sentinel-2 L2A scale=1 anyway
+        rescale=False,
     )
+
+    # Merge back into a single (time × band × y × x) DataArray.
+    # stackstac attaches per-band STAC metadata as non-dimension coordinates
+    # (common_name, center_wavelength, etc.).  SCL lacks most of these, so
+    # xr.concat raises ValueError unless we strip them first.
+    _STAC_BAND_COORDS = [
+        "common_name", "center_wavelength", "full_width_half_max",
+        "gsd", "title", "epsg", "proj:shape", "proj:transform",
+    ]
+    def _strip_band_meta(da: xr.DataArray) -> xr.DataArray:
+        drop = [c for c in _STAC_BAND_COORDS if c in da.coords]
+        return da.drop_vars(drop) if drop else da
+
+    stack = xr.concat([_strip_band_meta(stack_ref), _strip_band_meta(stack_scl)], dim="band")
 
     logger.info(
         "Stack shape: %s  bands: %s  chunks: %s",
@@ -190,10 +235,73 @@ def compute_greenest_pixel_composite(
     # This filter operates on actual reflectance values, not SCL labels.
     haze_blue = b02 > BLUE_HAZE_DN                         # absolute blue elevation
     haze_ratio = (b02 / (b04 + 1e-6)) > HAZE_BR_RATIO     # blue/red excess → scattering
-    haze_mask = haze_blue | (haze_ratio & (b02 > 1200))    # (time, y, x) bool
+    haze_mask = haze_blue | (haze_ratio & (b02 > 1200))
     clear = clear & ~haze_mask
-    logger.info("Radiometric haze filter applied (B02>%d or B02/B04>%.1f)",
+    logger.info("Radiometric pixel-haze filter: B02>%d or B02/B04>%.1f",
                 BLUE_HAZE_DN, HAZE_BR_RATIO)
+
+    # ── Scene-level haze rejection ───────────────────────────────────────
+    # Regional smoke / aerosol events make every pixel in a scene subtly hazy at
+    # 1000–1400 DN — below the per-pixel threshold, but still clearly hazy visually.
+    # Compute median B02 over SCL-clear pixels per scene (cheap: (time,) shape).
+    # Scenes whose median exceeds SCENE_HAZE_B02_MEDIAN are flagged and their
+    # pixels never win the NDVI argmax.
+    # Rebuild a raw (pre-dilation) SCL mask for scene scoring to avoid
+    # geometry-aware erosion bias on the median.
+    _scl_clear_raw = xr.ones_like(scl, dtype=bool)
+    for _cls in CLOUD_CLASSES:
+        _scl_clear_raw = _scl_clear_raw & (scl != _cls)
+
+    # median B02 per scene over all SCL-clear pixels → shape (time,)
+    scene_b02_median = (
+        b02.where(_scl_clear_raw)  # NaN on cloudy pixels
+        .median(dim=["y", "x"])    # spatial reduction → (time,)  -- lazy
+        .compute()                  # only (n_scenes,) values, < 1 s
+        .values.astype(np.float32)
+    )
+    # Adaptive threshold: 25th-percentile of scene medians is the "clean" reference.
+    # Reject scenes that are SCENE_HAZE_RELATIVE_FACTOR above that reference,
+    # with a minimum margin of SCENE_HAZE_MIN_MARGIN_DN.
+    valid_medians_mask = ~np.isnan(scene_b02_median)
+    if valid_medians_mask.sum() >= SCENE_HAZE_MIN_KEEP:
+        ref_b02 = float(np.percentile(scene_b02_median[valid_medians_mask], 25))
+        adaptive_thresh = max(
+            ref_b02 * SCENE_HAZE_RELATIVE_FACTOR,
+            ref_b02 + SCENE_HAZE_MIN_MARGIN_DN,
+        )
+    else:
+        ref_b02 = float(np.nanmin(scene_b02_median)) if valid_medians_mask.any() else 99999.0
+        adaptive_thresh = ref_b02 + SCENE_HAZE_MIN_MARGIN_DN
+    hazy_scene_flags = np.isnan(scene_b02_median) | (scene_b02_median > adaptive_thresh)
+    # Safety: never leave fewer than SCENE_HAZE_MIN_KEEP scenes
+    n_remaining = int((~hazy_scene_flags).sum())
+    if n_remaining < SCENE_HAZE_MIN_KEEP:
+        hazy_scene_flags = np.zeros(n_times, dtype=bool)
+        logger.warning(
+            "Scene haze filter would leave only %d/%d scenes — filter skipped. "
+            "Scene medians: %s",
+            n_remaining, n_times, np.round(scene_b02_median, 0).tolist(),
+        )
+    n_hazy_scenes = int(hazy_scene_flags.sum())
+    if n_hazy_scenes > 0:
+        logger.info(
+            "Scene-level haze: %d/%d scenes rejected (adaptive thresh=%.0f DN, "
+            "p25 ref=%.0f DN). Scene medians: %s",
+            n_hazy_scenes, n_times, adaptive_thresh, ref_b02,
+            np.round(scene_b02_median, 0).tolist(),
+        )
+        hazy_scene_da = xr.DataArray(
+            hazy_scene_flags,
+            dims=["time"],
+            coords={"time": stack.coords["time"]},
+        )
+        clear = clear & ~hazy_scene_da
+    else:
+        logger.info(
+            "Scene-level haze: all %d scenes passed (adaptive thresh=%.0f DN, "
+            "p25 ref=%.0f DN, max median=%.0f DN).",
+            n_times, adaptive_thresh, ref_b02, float(np.nanmax(scene_b02_median)),
+        )
 
     # ── NDVI with cloud masking applied ──────────────────────────────
     ndvi_raw = (b08 - b04) / (b08 + b04 + 1e-9)
