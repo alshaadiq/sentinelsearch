@@ -32,6 +32,9 @@ pyproj==3.6.1
 # Image preview
 Pillow==10.3.0
 
+# Gap-filling / spatial interpolation
+scipy>=1.12,<2
+
 # Utilities
 httpx==0.27.0
 python-dateutil==2.9.0

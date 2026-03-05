@@ -98,7 +98,13 @@ def run_composite(self: Task, *, job_id: str) -> dict:
         output_crs=output_crs,
     )
 
-    # ── 6. Generate PNG preview ───────────────────────────────────────
+    # ── 6. Gap-fill cloud / shadow patches ───────────────────────────
+    update_progress(job_id, "gap_fill", 85, "Filling cloud/shadow gaps")
+    from processing.gap_fill import fill_composite_gaps
+
+    cog_path = fill_composite_gaps(cog_path=cog_path)
+
+    # ── 7. Generate PNG preview ───────────────────────────────────────
     update_progress(job_id, "preview", 90, "Generating PNG quicklook")
     from processing.export_preview import export_preview
 
