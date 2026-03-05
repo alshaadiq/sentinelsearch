@@ -80,13 +80,38 @@ def export_preview(cog_path: Path, job_id: str) -> Path:
             raw[(raw < 0) | (raw > 10000)] = np.nan
             channels.append(raw)
 
-    # ── Per-channel 2–98 percentile stretch, clouds excluded ─────────
-    # Cloud pixels are typically 6000–10000 DN; including them in the
-    # percentile crushes all land into the bottom 10-20% of brightness.
-    # Solution: compute stretch from "clear-land" range only (≤ CLOUD_DN_THRESH),
-    # then clip the full image (clouds clip to white, shadows to black).
-    CLOUD_DN_THRESH = 4000   # safe upper bound for S-2 L2A clear land
-    GAMMA = 1.4              # gamma < 1 brightens mid-tones; 1.4 lifts shadows
+    # ── Linked stretch across all three channels ──────────────────────
+    # KEY: use a SINGLE shared lo/hi derived from all three channels pooled.
+    # Independent per-channel stretch breaks R:G:B ratios:
+    #   water (B04≈100, B03≈200, B02≈500) → independent stretch → purple
+    #   soil  (B04≈3500, B03≈2800, B02≈2000) → independent stretch → orange
+    # With a shared stretch, relative reflectance ratios are preserved,
+    # giving natural-looking colours regardless of scene content.
+    #
+    # CLOUD_DN_THRESH: clouds are ~6000–10000 DN; exclude them from the
+    # percentile sample so they don't compress the land into a narrow range.
+    CLOUD_DN_THRESH = 6000   # S-2 L2A: soil/sand up to ~5500 is valid
+    GAMMA = 1.8              # lift shadows/water (>1 brightens mid-tones)
+
+    # Pool clear-land pixels from ALL three channels to get a single lo/hi
+    all_clear: list[np.ndarray] = []
+    for ch in channels:
+        finite = np.isfinite(ch)
+        clear = ch[finite & (ch <= CLOUD_DN_THRESH)]
+        if clear.size > 0:
+            all_clear.append(clear)
+
+    if all_clear:
+        combined = np.concatenate(all_clear)
+        lo, hi = np.percentile(combined, [2, 98])
+    else:
+        # Fallback: use all finite pixels across channels
+        all_finite = np.concatenate([ch[np.isfinite(ch)] for ch in channels if np.any(np.isfinite(ch))])
+        lo, hi = np.percentile(all_finite, [2, 98]) if all_finite.size > 0 else (0.0, 3000.0)
+    if hi <= lo:
+        hi = lo + 1.0
+
+    logger.debug("Preview stretch: lo=%.0f  hi=%.0f  (shared across R/G/B)", lo, hi)
 
     rgb_stretched = []
     for ch in channels:
@@ -95,19 +120,9 @@ def export_preview(cog_path: Path, job_id: str) -> Path:
             rgb_stretched.append(np.full((out_h, out_w), 128, dtype=np.uint8))
             continue
 
-        # Use only clear-land pixels for percentile (exclude cloud-bright pixels)
-        clear_pixels = ch[(finite_mask) & (ch <= CLOUD_DN_THRESH)]
-        if clear_pixels.size < 100:
-            # Fall back to all valid pixels if most are clouds
-            clear_pixels = ch[finite_mask]
-
-        lo, hi = np.percentile(clear_pixels, [2, 98])
-        if hi <= lo:
-            hi = lo + 1.0
-
-        # Stretch and clip (clouds → 1.0 = white; shadows → 0.0 = black)
+        # Stretch with shared lo/hi; clouds clip to white, deep shadow to black
         stretched = np.clip((ch - lo) / (hi - lo), 0.0, 1.0)
-        # Gamma correction to lift mid-tones (gamma > 1 brightens)
+        # Gamma > 1 brightens mid-tones (especially dark water/flooded fields)
         stretched = np.power(stretched, 1.0 / GAMMA)
         out = (np.nan_to_num(stretched, nan=0.0) * 255).astype(np.uint8)
         out[~finite_mask] = 0
