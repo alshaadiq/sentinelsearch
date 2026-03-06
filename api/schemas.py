@@ -31,6 +31,11 @@ class GeoJSONGeometry(BaseModel):
 # Request
 # ──────────────────────────────────────────────
 
+class CompositeMethod(str, Enum):
+    GREENEST_PIXEL = "greenest_pixel"
+    CLOUD_PATCHING = "cloud_patching"
+
+
 class CompositeRequest(BaseModel):
     """Body sent by the frontend to submit a new composite job."""
 
@@ -43,6 +48,10 @@ class CompositeRequest(BaseModel):
     output_crs: str = Field(
         "EPSG:4326",
         description="Output CRS for the Cloud Optimized GeoTIFF.",
+    )
+    method: CompositeMethod = Field(
+        CompositeMethod.GREENEST_PIXEL,
+        description="Compositing algorithm to use.",
     )
 
     @model_validator(mode="after")

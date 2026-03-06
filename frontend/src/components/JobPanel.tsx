@@ -5,6 +5,7 @@
 import React from "react";
 import type {
   BandInfo,
+  CompositeMethod,
   GeoJSONGeometry,
   JobResultResponse,
   JobStatus,
@@ -17,6 +18,8 @@ interface JobPanelProps {
   dateEnd: string;
   onDateStartChange: (v: string) => void;
   onDateEndChange: (v: string) => void;
+  method: CompositeMethod;
+  onMethodChange: (v: CompositeMethod) => void;
   onSubmit: () => void;
   jobStatus: JobStatusResponse | null;
   jobResult: JobResultResponse | null;
@@ -36,12 +39,32 @@ const STAGE_LABELS: Record<string, string> = {
   loading: "Loading parameters",
   stac_search: "Searching scenes",
   build_stack: "Building raster stack",
+  brdf: "BRDF normalisation",
   composite: "Computing composite",
   export_cog: "Exporting COG",
+  gap_fill: "Filling cloud gaps",
   preview: "Generating preview",
   done: "Complete",
   failed: "Failed",
 };
+
+const METHOD_OPTIONS: { value: CompositeMethod; label: string; description: string }[] = [
+  {
+    value: "greenest_pixel",
+    label: "Greenest Pixel (NDVI)",
+    description:
+      "Selects the pixel with the highest NDVI across all cloud-free scenes. " +
+      "Best for maximizing vegetation coverage and handling dispersed cloud cover.",
+  },
+  {
+    value: "cloud_patching",
+    label: "Cloud Patching from Best Scene",
+    description:
+      "Starts with the least-cloudy scene as a base, then progressively patches " +
+      "remaining cloud-covered pixels from the next clearest scenes. " +
+      "Best for preserving spectral consistency when one scene is nearly cloud-free.",
+  },
+];
 
 export const JobPanel: React.FC<JobPanelProps> = ({
   aoi,
@@ -49,6 +72,8 @@ export const JobPanel: React.FC<JobPanelProps> = ({
   dateEnd,
   onDateStartChange,
   onDateEndChange,
+  method,
+  onMethodChange,
   onSubmit,
   jobStatus,
   jobResult,
@@ -56,6 +81,7 @@ export const JobPanel: React.FC<JobPanelProps> = ({
   error,
 }) => {
   const canSubmit = !!aoi && !!dateStart && !!dateEnd && !isSubmitting;
+  const selectedMethod = METHOD_OPTIONS.find((m) => m.value === method)!;
 
   return (
     <div className="flex flex-col gap-5 h-full overflow-y-auto">
@@ -104,6 +130,30 @@ export const JobPanel: React.FC<JobPanelProps> = ({
             className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 focus:outline-none focus:ring-2 focus:ring-sentinel-500"
           />
         </label>
+      </div>
+
+      {/* Compositing method */}
+      <div className="flex flex-col gap-2">
+        <label className="text-sm text-gray-400 font-medium">
+          Compositing method
+        </label>
+        <select
+          value={method}
+          onChange={(e) => onMethodChange(e.target.value as CompositeMethod)}
+          disabled={isSubmitting}
+          className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm
+            focus:outline-none focus:ring-2 focus:ring-sentinel-500
+            disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {METHOD_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))}
+        </select>
+        <p className="text-xs text-gray-500 leading-relaxed">
+          {selectedMethod.description}
+        </p>
       </div>
 
       {/* Submit */}
@@ -210,8 +260,8 @@ export const JobPanel: React.FC<JobPanelProps> = ({
       <div className="mt-auto text-xs text-gray-600 space-y-1 pt-2 border-t border-gray-800">
         <p>1. Draw polygon or rectangle on map</p>
         <p>2. Select date range (max 6 months)</p>
-        <p>3. Click Generate Composite</p>
-        <p>4. Wait for processing to complete</p>
+        <p>3. Choose compositing method</p>
+        <p>4. Click Generate Composite</p>
         <p>5. Download COG or view preview</p>
       </div>
     </div>

@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 
 from api.schemas import (
     BandInfo,
+    CompositeMethod,
     CompositeRequest,
     JobProgress,
     JobResultResponse,
@@ -84,6 +85,7 @@ async def submit_job(req: CompositeRequest) -> JSONResponse:
             "date_start": str(req.date_start),
             "date_end": str(req.date_end),
             "output_crs": req.output_crs,
+            "method": req.method.value,
         },
     }
     write_job_meta(job_id, meta)

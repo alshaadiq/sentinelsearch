@@ -13,6 +13,7 @@ import {
   submitJob,
   getJobStatus,
   getJobResult,
+  type CompositeMethod,
   type GeoJSONGeometry,
   type JobStatusResponse,
   type JobResultResponse,
@@ -66,6 +67,7 @@ export default function App() {
   const [jobResult, setJobResult] = useState<JobResultResponse | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [method, setMethod] = useState<CompositeMethod>("greenest_pixel");
 
   // Capture date range label at submit time
   const pendingLabelRef = useRef<string>("");
@@ -103,6 +105,7 @@ export default function App() {
         date_start: dateStart,
         date_end: dateEnd,
         output_crs: "EPSG:4326",
+        method,
       });
       setJobId(job_id);
     } catch (err: unknown) {
@@ -199,6 +202,8 @@ export default function App() {
           dateEnd={dateEnd}
           onDateStartChange={setDateStart}
           onDateEndChange={setDateEnd}
+          method={method}
+          onMethodChange={setMethod}
           onSubmit={handleSubmit}
           jobStatus={jobStatus}
           jobResult={jobResult}

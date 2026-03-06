@@ -389,3 +389,263 @@ def compute_greenest_pixel_composite(
 
     logger.info("Composite dataset built: %s  CRS=%s", composite_ds, native_crs)
     return composite_ds, used_scenes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cloud-Patching composite
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Fraction of total pixels that may remain cloud/shadow after patching before
+# we declare "good enough" and stop pulling in more scenes.
+CLOUD_PATCH_STOP_THRESHOLD_PCT: float = 2.0
+
+
+def compute_cloud_patching_composite(
+    stack: xr.DataArray,
+    items: list,
+    progress_callback=None,
+) -> Tuple[xr.Dataset, int]:
+    """
+    Cloud-Patching-from-Best-Scene composite.
+
+    Algorithm
+    ---------
+    1.  Rank all input scenes by STAC ``eo:cloud_cover`` property (ascending).
+    2.  Start with the least-cloudy scene as the base composite.
+    3.  For each subsequent scene (in ascending cloud-cover order):
+        a. Identify pixels that are still bad in the current composite
+           (cloud / shadow SCL class, or NaN).
+        b. Build a clear mask for this scene (SCL + radiometric haze filter).
+        c. Copy scene pixel values into the composite wherever both conditions
+           hold (composite bad  AND  scene clear).
+        d. Stop early if residual bad pixels fall below
+           ``CLOUD_PATCH_STOP_THRESHOLD_PCT`` of the total pixel count, or
+           when no more scenes remain.
+    4.  Pixels that are never covered by any clear observation are left as NaN
+        (transparent — gap-fill handles the rest).
+
+    Parameters
+    ----------
+    stack : xr.DataArray
+        (time × band × y × x) from :func:`build_stack`.
+    items : list of pystac.Item
+        STAC items in the same time order as ``stack``.
+    progress_callback : callable(pct: int, msg: str) | None
+        Optional hook called after each scene is applied.
+
+    Returns
+    -------
+    composite_ds : xr.Dataset
+    used_scenes : int
+    """
+    import pystac  # noqa: F401 (type hint only)
+
+    n_times = stack.sizes["time"]
+    band_list = list(stack.band.values)
+    n_bands_out = len(ANALYSIS_BANDS)
+
+    # Band indices inside the stack (used for per-scene numpy extraction)
+    def _bidx(name: str) -> int:
+        return band_list.index(name)
+
+    scl_bidx = _bidx("SCL")
+    b02_bidx = _bidx("B02")
+    b04_bidx = _bidx("B04")
+
+    # ── Step 1: rank scenes by AOI cloud cover (preferred) or eo:cloud_cover ──────
+    cloud_covers = [
+        float(
+            item.properties.get("aoi_cloud_cover")
+            or item.properties.get("eo:cloud_cover")
+            or 100.0
+        )
+        for item in items
+    ]
+    sorted_t_indices = sorted(range(n_times), key=lambda t: cloud_covers[t])
+    logger.info(
+        "Cloud patching: %d scenes ranked by cloud cover. "
+        "Best: %.1f%%, Worst: %.1f%%",
+        n_times,
+        cloud_covers[sorted_t_indices[0]],
+        cloud_covers[sorted_t_indices[-1]],
+    )
+
+    ny, nx = stack.sizes["y"], stack.sizes["x"]
+    n_total = ny * nx
+    y_coords = stack.y.values
+    x_coords = stack.x.values
+
+    # Output array — all NaN initially
+    output_np = np.full((n_bands_out, ny, nx), np.nan, dtype=np.float32)
+    # still_bad: True for every pixel not yet filled with valid data
+    still_bad = np.ones((ny, nx), dtype=bool)
+
+    used_scene_indices: list[int] = []
+
+    for rank, t_idx in enumerate(sorted_t_indices):
+        if not still_bad.any():
+            logger.info("Cloud patching: all pixels filled after %d scenes.", len(used_scene_indices))
+            break
+
+        scene_cc = cloud_covers[t_idx]
+        logger.info(
+            "Cloud patching: applying scene %d/%d (t=%d, CC=%.1f%%) — "
+            "%d px (%.1f%%) still need filling",
+            rank + 1, n_times, t_idx, scene_cc,
+            int(still_bad.sum()), still_bad.sum() / n_total * 100,
+        )
+
+        # Load this scene's data (all bands)
+        scene_data = stack.isel(time=t_idx).compute().values  # (band, y, x)
+
+        scl_scene = scene_data[scl_bidx]
+        b02_scene = scene_data[b02_bidx]
+        b04_scene = scene_data[b04_bidx]
+
+        # ── Build per-pixel clear mask for this scene ─────────────────
+        scene_clear = np.ones((ny, nx), dtype=bool)
+        for cls in CLOUD_CLASSES:
+            scene_clear &= (scl_scene != cls)
+
+        # Radiometric haze filter (same thresholds as greenest-pixel method)
+        haze = (b02_scene > BLUE_HAZE_DN) | (
+            (b02_scene / (b04_scene + 1e-6) > HAZE_BR_RATIO) & (b02_scene > 1200)
+        )
+        scene_clear &= ~haze
+
+        # NaN guard: scene pixel must have valid data in B02 at minimum
+        scene_clear &= np.isfinite(b02_scene)
+
+        # ── Scene-level haze check ────────────────────────────────────
+        # If this scene's median B02 over clear pixels is way above the
+        # adaptive reference, skip the whole scene.
+        scene_b02_clear = b02_scene[scene_clear]
+        if scene_b02_clear.size > 100:
+            scene_median_b02 = float(np.median(scene_b02_clear))
+            # Use a simple heuristic: skip if median > 2 × global reference (800 DN)
+            if scene_median_b02 > 2400:
+                logger.info(
+                    "  → Scene skipped: median B02 = %.0f DN (likely hazy)", scene_median_b02
+                )
+                del scene_data
+                continue
+
+        # ── Pixels to fill: bad in composite AND clear in this scene ──
+        fill_here = still_bad & scene_clear
+        n_fill = int(fill_here.sum())
+        if n_fill == 0:
+            del scene_data
+            continue
+
+        # ── Relative radiometric normalisation (histogram matching) ───
+        # For each reflectance band, compute mean/std in the overlap region
+        # (pixels clear in BOTH the current composite and this scene), then
+        # linearly rescale the scene to match the composite's statistics.
+        # This removes cross-scene brightness/haze offsets so patches blend
+        # seamlessly without visible seams.
+        #   normalised_px = (raw_px - scene_mean) / scene_std * comp_std + comp_mean
+        # "SCL" and "NDVI" are skipped (classification / derived, not reflectance).
+        overlap = (~still_bad) & scene_clear  # pixels valid in both
+        n_overlap = int(overlap.sum())
+
+        scene_data_norm = scene_data.copy()
+        if n_overlap >= 50:  # need enough samples for stable statistics
+            for b_idx, band_name in enumerate(ANALYSIS_BANDS):
+                if band_name in ("SCL", "NDVI"):
+                    continue
+                src_bidx = _bidx(band_name)
+                comp_vals  = output_np[b_idx][overlap].astype(np.float64)
+                scene_vals = scene_data[src_bidx][overlap].astype(np.float64)
+
+                comp_mean,  comp_std  = comp_vals.mean(),  comp_vals.std()
+                scene_mean, scene_std = scene_vals.mean(), scene_vals.std()
+
+                # Skip if std is near-zero (uniform region — avoid divide-by-zero)
+                if scene_std < 1.0:
+                    continue
+
+                scale  = comp_std / scene_std
+                offset = comp_mean - scale * scene_mean
+
+                # Apply transform to the WHOLE scene band (fill pixels only)
+                raw = scene_data[src_bidx].astype(np.float64)
+                corrected = raw * scale + offset
+                # Clip to valid S-2 DN range so we don't introduce outliers
+                corrected = np.clip(corrected, 0.0, 10000.0)
+                scene_data_norm[src_bidx] = corrected.astype(np.float32)
+
+            logger.info(
+                "  → Normalised patch scene t=%d against composite (%d overlap px)",
+                t_idx, n_overlap,
+            )
+        else:
+            logger.info(
+                "  → Skipped normalisation for scene t=%d: only %d overlap px",
+                t_idx, n_overlap,
+            )
+
+        # ── Copy normalised values ────────────────────────────────────
+        for b_idx, band_name in enumerate(ANALYSIS_BANDS):
+            src_bidx = _bidx(band_name)
+            output_np[b_idx][fill_here] = scene_data_norm[src_bidx][fill_here]
+
+        del scene_data_norm
+
+        still_bad[fill_here] = False
+        used_scene_indices.append(t_idx)
+        del scene_data
+
+        pct_remain = still_bad.sum() / n_total * 100
+        if progress_callback is not None:
+            progress_callback(
+                int(40 + 38 * (rank + 1) / n_times),
+                f"Scene {rank+1}/{n_times} applied (CC {scene_cc:.0f}%) — "
+                f"{pct_remain:.1f}% pixels remaining",
+            )
+
+        if pct_remain < CLOUD_PATCH_STOP_THRESHOLD_PCT:
+            logger.info(
+                "Cloud patching: stopping early — only %.2f%% pixels remain bad "
+                "(threshold %.1f%%).",
+                pct_remain, CLOUD_PATCH_STOP_THRESHOLD_PCT,
+            )
+            break
+
+    used_scenes = len(used_scene_indices)
+    pct_unfilled = still_bad.sum() / n_total * 100
+    logger.info(
+        "Cloud patching complete: %d/%d scenes used, %.1f%% pixels unfilled (→ gap-fill).",
+        used_scenes, n_times, pct_unfilled,
+    )
+
+    # ── Build output Dataset ──────────────────────────────────────────
+    output_vars: dict[str, xr.DataArray] = {}
+    for b_idx, band_name in enumerate(ANALYSIS_BANDS):
+        output_vars[band_name] = xr.DataArray(
+            output_np[b_idx],
+            dims=["y", "x"],
+            coords={"y": y_coords, "x": x_coords},
+            name=band_name,
+            attrs={"long_name": band_name, "grid_mapping": "spatial_ref"},
+        )
+    del output_np
+
+    b04_final = output_vars["B04"].values.astype(np.float32)
+    b08_final = output_vars["B08"].values.astype(np.float32)
+    ndvi_final = (b08_final - b04_final) / (b08_final + b04_final + 1e-9)
+    output_vars["NDVI"] = xr.DataArray(
+        ndvi_final,
+        dims=["y", "x"],
+        coords={"y": y_coords, "x": x_coords},
+        name="NDVI",
+        attrs={"long_name": "NDVI (cloud-patching composite)"},
+    )
+
+    composite_ds = xr.Dataset(output_vars)
+    native_crs = stack.rio.crs
+    if native_crs is not None:
+        composite_ds = composite_ds.rio.write_crs(native_crs)
+    composite_ds = composite_ds.rio.set_spatial_dims(x_dim="x", y_dim="y")
+
+    logger.info("Cloud-patching composite dataset built: CRS=%s", native_crs)
+    return composite_ds, used_scenes

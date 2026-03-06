@@ -9,11 +9,14 @@ export interface GeoJSONGeometry {
   coordinates: number[][][] | number[][][][];
 }
 
+export type CompositeMethod = "greenest_pixel" | "cloud_patching";
+
 export interface CompositeRequest {
   aoi: GeoJSONGeometry;
   date_start: string; // YYYY-MM-DD
   date_end: string;   // YYYY-MM-DD
   output_crs?: string;
+  method?: CompositeMethod;
 }
 
 export interface JobProgress {

@@ -45,7 +45,7 @@ class BaseCompositeTask(Task):
     soft_time_limit=3300,
 )
 def run_composite(self: Task, *, job_id: str) -> dict:
-    """Orchestrate the full Sentinel-2 greenest-pixel composite pipeline."""
+    """Orchestrate the full Sentinel-2 composite pipeline."""
 
     # ── 1. Load job metadata ──────────────────────────────────────────
     update_progress(job_id, "loading", 5, "Loading job parameters")
@@ -58,22 +58,27 @@ def run_composite(self: Task, *, job_id: str) -> dict:
     date_start = req["date_start"]
     date_end = req["date_end"]
     output_crs = req.get("output_crs", None)  # None → keep native UTM CRS
+    method = req.get("method", "greenest_pixel")
 
     # ── 2. STAC search ────────────────────────────────────────────────
     update_progress(job_id, "stac_search", 10, "Searching Planetary Computer STAC")
     from processing.stac_search import search_sentinel2_scenes
 
+    # Cloud patching handles clouds itself — fetch all scenes regardless of cover.
+    cc_override = 100.0 if method == "cloud_patching" else None
+
     items = search_sentinel2_scenes(
         aoi_geojson=aoi_geojson,
         date_start=date_start,
         date_end=date_end,
+        cloud_cover_max=cc_override,
     )
     if not items:
         raise RuntimeError(
             f"No Sentinel-2 scenes found for the given AOI and date range "
-            f"({date_start} → {date_end}) with cloud cover < settings limit."
+            f"({date_start} → {date_end})."
         )
-    logger.info("Job %s: found %d scenes", job_id, len(items))
+    logger.info("Job %s: found %d scenes (method=%s)", job_id, len(items), method)
     update_progress(job_id, "stac_search", 15, f"Found {len(items)} scenes")
 
     # ── 3. Build lazy stack ───────────────────────────────────────────
@@ -88,11 +93,26 @@ def run_composite(self: Task, *, job_id: str) -> dict:
 
     stack = brdf_normalize_stack(stack=stack, items=items)
 
-    # ── 5. Cloud mask + NDVI composite ───────────────────────────────
-    update_progress(job_id, "composite", 40, "Applying cloud mask and computing composite")
-    from processing.composite import compute_greenest_pixel_composite
+    # ── 5. Composite ─────────────────────────────────────────────────
+    if method == "cloud_patching":
+        update_progress(job_id, "composite", 40,
+                        "Sorting scenes by cloud cover and patching")
+        from processing.composite import compute_cloud_patching_composite
 
-    composite_ds, used_scenes = compute_greenest_pixel_composite(stack=stack)
+        def _cp_progress(pct: int, msg: str):
+            update_progress(job_id, "composite", pct, msg)
+
+        composite_ds, used_scenes = compute_cloud_patching_composite(
+            stack=stack,
+            items=items,
+            progress_callback=_cp_progress,
+        )
+    else:
+        update_progress(job_id, "composite", 40,
+                        "Applying cloud mask and computing greenest-pixel composite")
+        from processing.composite import compute_greenest_pixel_composite
+
+        composite_ds, used_scenes = compute_greenest_pixel_composite(stack=stack)
 
     # ── 5. Export COG ─────────────────────────────────────────────────
     update_progress(job_id, "export_cog", 80, "Writing Cloud Optimized GeoTIFF")

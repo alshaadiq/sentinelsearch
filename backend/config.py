@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     max_scenes: int = 30
     max_aoi_km2: float = 2500.0
     max_date_range_days: int = 180
-    cloud_cover_max: float = 40.0
+    cloud_cover_max: float = 60.0
 
     # Logging
     log_level: str = "INFO"
